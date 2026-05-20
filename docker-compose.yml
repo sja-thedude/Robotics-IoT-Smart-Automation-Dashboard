@@ -1,0 +1,118 @@
+# ═══════════════════════════════════════════════════════════════════════
+#  RoboGrid AI — full local/production stack
+#
+#  Services
+#    postgres      relational store (devices, telemetry, alerts, audit)
+#    redis         cache + channel layer + celery broker/result
+#    mosquitto     MQTT broker for device communication
+#    web           ASGI app (REST + WebSockets) behind Nginx
+#    mqtt_bridge   subscribes to the fleet, ingests telemetry/status/results
+#    celery_worker async tasks (health, notifications, retention)
+#    celery_beat   periodic scheduler
+#    nginx         TLS termination, static files, reverse proxy + ws upgrade
+# ═══════════════════════════════════════════════════════════════════════
+x-app: &app
+  build: .
+  image: robogrid/app:latest
+  env_file: .env
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    ports:
+      - "1883:1883"   # MQTT
+      - "9001:9001"   # MQTT over WebSockets
+    volumes:
+      - ./mosquitto/config:/mosquitto/config
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    restart: unless-stopped
+
+  web:
+    <<: *app
+    environment:
+      RUN_MIGRATIONS: "true"   # this container owns migrate + collectstatic
+    volumes:
+      - static_data:/app/staticfiles
+      - media_data:/app/media
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "8000"
+
+  mqtt_bridge:
+    <<: *app
+    command: ["python", "manage.py", "run_mqtt_bridge"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+
+  celery_worker:
+    <<: *app
+    command: ["celery", "-A", "config", "worker", "-l", "info", "--concurrency", "4"]
+
+  celery_beat:
+    <<: *app
+    command: ["celery", "-A", "config", "beat", "-l", "info",
+              "--scheduler", "django_celery_beat.schedulers:DatabaseScheduler"]
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      - web
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - static_data:/app/staticfiles:ro
+      - media_data:/app/media:ro
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  redis_data:
+  mosquitto_data:
+  mosquitto_log:
+  static_data:
+  media_data:
